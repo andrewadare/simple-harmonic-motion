@@ -5,12 +5,14 @@
 // Change as needed
 static i2c_port_t i2c_port = I2C_NUM_0;
 
+// Internal pullups are 45k on ESP32. Use stronger external pullups for more
+// reliable I2C.
 void configure_i2c_master(i2c_port_t i2c_num, gpio_num_t sda, gpio_num_t scl) {
   i2c_config_t conf = {.mode = I2C_MODE_MASTER,
                        .sda_io_num = sda,
                        .scl_io_num = scl,
-                       .sda_pullup_en = GPIO_PULLUP_ENABLE,
-                       .scl_pullup_en = GPIO_PULLUP_ENABLE,
+                       .sda_pullup_en = GPIO_PULLUP_DISABLE,
+                       .scl_pullup_en = GPIO_PULLUP_DISABLE,
                        .master.clk_speed = 100000};
   i2c_param_config(i2c_num, &conf);
   i2c_driver_install(i2c_num, conf.mode, 0, 0, 0);
