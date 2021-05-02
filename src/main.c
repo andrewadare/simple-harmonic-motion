@@ -1,6 +1,7 @@
 // TODO: use a mutex semaphore for UART traffic
 
-// std lib
+// Builtins
+#include <math.h>
 #include <stdio.h>
 
 // ESP IDF
@@ -41,10 +42,10 @@ static void IRAM_ATTR limit_switch_isr(void* args) {
   xQueueSendFromISR(limit_switch_queue, &pin_number, NULL);
 }
 
-typedef enum { MOVING_DOWN, MOVING_UP, STATIONARY } actuator_direction_t;
+typedef enum { MOVING_DOWN, MOVING_UP, DIRECTION_UNKNOWN } actuator_direction_t;
 
 typedef struct {
-  int position;         // 0-4095, datum arb. but fixed
+  int position;         // 0-4095, datum arb. but fixed. Init to -1
   float rotation_rate;  // signed ang. speed in 12-bit units per timestep
   int rotations;        // signed rotation count
   float radius;         // [cm] Half pitch diam. For rot. to lin. conversion
@@ -61,6 +62,50 @@ void master_timer_callback(TimerHandle_t timer) {
   xSemaphoreGive(master_tick_signal);
 }
 
+// IIR filter using exponentially weighted moving average.
+// 0 <= alpha < 1 is a smoothing factor (larger -> smoother)
+void filter_ema(const float alpha, const float x_meas, float* x_filt) {
+  *x_filt = (1.0 - alpha) * x_meas + alpha * (*x_filt);
+}
+
+// Return x wrapped into the interval [a, b)
+int wrap(const float x, const float a, const float b) {
+  if (x < a) {
+    return x + b - a;
+  }
+  if (x >= b) {
+    return x - b + a;
+  }
+  return x;
+}
+
+// Update actuator structure from a measured 12 bit rotational position
+// measurement. The AS5600 magnetic sensor occasionally reports anomalous
+// samples. For sufficiently hight sample rates, the angular velocity should be
+// fairly smooth. If an excursion is detected, the bad measurement is replaced
+// with a dead reckoning estimate.
+void update_actuator(const int position, actuator_t* a) {
+  float delta = 0;  // Change from previous position
+  static int num_dead_reckon_steps = 0;
+
+  if (a->pulley.position >= 0) {  // true except at initialization
+    delta = position - a->pulley.position;
+    delta = wrap(delta, -2048, 2048);
+  }
+
+  if (fabs(delta - a->pulley.rotation_rate) > 20.0 &&
+      num_dead_reckon_steps < 2) {
+    ESP_LOGW("update_actuator", "Skip: delta - EMA = %.2f",
+             delta - a->pulley.rotation_rate);
+    a->pulley.position += a->pulley.rotation_rate;
+    num_dead_reckon_steps++;
+  } else {
+    a->pulley.position = position;
+    filter_ema(0.6, delta, &a->pulley.rotation_rate);
+    num_dead_reckon_steps = 0;
+  }
+}
+
 void sample_as5600_task(void* params) {
   esp_err_t ret = ESP_FAIL;
   uint16_t position = 0;  // angle encoded as a 12 bit value
@@ -75,11 +120,10 @@ void sample_as5600_task(void* params) {
     if (ret == ESP_ERR_TIMEOUT) {
       ESP_LOGE("AS5600", "I2C timeout");
     } else if (ret == ESP_OK) {
-      actuator->pulley.position = position;
-      ESP_LOGI("AS5600", "%d", actuator->pulley.position);
+      update_actuator(position, actuator);
+      ESP_LOGI("AS5600", "%d %.2f", actuator->pulley.position,
+               actuator->pulley.rotation_rate);
     }
-
-    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -154,7 +198,14 @@ void configure_motor_pwm() {
 }
 
 void app_main() {
-  actuator_t actuator;
+  actuator_t actuator = {.pulley = {.position = -1,
+                                    .rotation_rate = 0,
+                                    .rotations = 0,
+                                    .radius = 1.5 /*cm*/},
+                         .position = -1,
+                         .speed = 0,
+                         .direction = DIRECTION_UNKNOWN};
+
   master_tick_signal = xSemaphoreCreateBinary();
 
   configure_onboard_led();
