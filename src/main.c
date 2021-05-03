@@ -200,14 +200,10 @@ void limit_switch_task(void* params) {
         gpio_set_level(onboard_led_pin, 1);
 
         // Home the actuator
-        // Set the rotation count to 1 as the carriage presses the limit switch
-        // down. As it rebounds upward, the pulley rotation will be negative
-        // and the rotation count will be decremented to zero as the datum is
-        // crossed.
         bool already_homed = actuator->homed;
         actuator->pulley.datum = actuator->pulley.position;
         actuator->position = 0;
-        actuator->pulley.rotations = 1;
+        actuator->pulley.rotations = 0;
         actuator->homed = true;
 
         ESP_LOGI("LIMIT_SWITCH", "Trigger count = %d. datum = %d. %s", count,
