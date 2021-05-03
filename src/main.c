@@ -16,6 +16,7 @@
 #include "freertos/timers.h"
 
 // local
+#include "actuator.h"
 #include "chip_introspection.h"
 #include "i2c_comms.h"
 
@@ -42,21 +43,17 @@ static void IRAM_ATTR limit_switch_isr(void* args) {
   xQueueSendFromISR(limit_switch_queue, &pin_number, NULL);
 }
 
-typedef enum { MOVING_DOWN, MOVING_UP, DIRECTION_UNKNOWN } actuator_direction_t;
-
-typedef struct {
-  int position;         // 0-4095, datum arb. but fixed. Init to -1
-  float rotation_rate;  // signed ang. speed in 12-bit units per timestep
-  int rotations;        // signed rotation count
-  float radius;         // [cm] Half pitch diam. For rot. to lin. conversion
-} pulley_t;
-
-typedef struct {
-  pulley_t pulley;
-  float position;                  // cm above limit switch
-  float speed;                     // cm/s, positive upward
-  actuator_direction_t direction;  // up/down/stationary
-} actuator_t;
+// Parameters passed to FreeRTOS tasks must be either global
+// or heap-allocated.
+static actuator_t actuator = {.pulley = {.position = -1,
+                                         .datum = 0,
+                                         .rotation_rate = 0,
+                                         .rotations = 0,
+                                         .radius = 1.5 /*cm*/},
+                              .position = -1,
+                              .speed = 0,
+                              .direction = DIRECTION_UNKNOWN,
+                              .homed = false};
 
 void master_timer_callback(TimerHandle_t timer) {
   xSemaphoreGive(master_tick_signal);
@@ -79,38 +76,91 @@ int wrap(const float x, const float a, const float b) {
   return x;
 }
 
+// TODO: corner case logic for datum near 0 or 4095
+bool datum_crossed(const int prev_position, actuator_t* a) {
+  if (!a->homed) {
+    return false;  // no datum yet
+  }
+
+  const int d = a->pulley.datum;
+  const int x = a->pulley.position;
+  const int xp = prev_position;
+  // const bool datum_outside = (x >= d && xp > d) || (x <= d && xp < d);
+
+  if (a->pulley.rotation_rate > 0) {
+    if (x >= d && d > xp) {
+      return true;
+    }
+    // if (x < xp && datum_outside) {
+    //   ESP_LOGW("DATUM_CROSSED", "w > 0, x < xp");
+    //   return true;
+    // }
+  }
+  if (a->pulley.rotation_rate < 0) {
+    if (x <= d && d < xp) {
+      return true;
+    }
+    // if (x > xp && datum_outside) {
+    //   ESP_LOGW("DATUM_CROSSED", "w < 0, x > xp");
+    //   return true;
+    // }
+  }
+  return false;
+}
+
 // Update actuator structure from a measured 12 bit rotational position
 // measurement. The AS5600 magnetic sensor occasionally reports anomalous
-// samples. For sufficiently hight sample rates, the angular velocity should be
+// samples. For sufficiently high sample rates, the angular velocity should be
 // fairly smooth. If an excursion is detected, the bad measurement is replaced
 // with a dead reckoning estimate.
 void update_actuator(const int position, actuator_t* a) {
   float delta = 0;  // Change from previous position
-  static int num_dead_reckon_steps = 0;
+  const int prev_position = a->pulley.position;
 
-  if (a->pulley.position >= 0) {  // true except at initialization
-    delta = position - a->pulley.position;
+  if (prev_position >= 0) {  // true except at initialization
+    delta = position - prev_position;
     delta = wrap(delta, -2048, 2048);
   }
 
+  // Update the pulley
+  static int num_dead_reckon_steps = 0;
   if (fabs(delta - a->pulley.rotation_rate) > 20.0 &&
       num_dead_reckon_steps < 2) {
     ESP_LOGW("update_actuator", "Skip: delta - EMA = %.2f",
              delta - a->pulley.rotation_rate);
-    a->pulley.position += a->pulley.rotation_rate;
+    a->pulley.position += round(a->pulley.rotation_rate);
     num_dead_reckon_steps++;
   } else {
     a->pulley.position = position;
     filter_ema(0.6, delta, &a->pulley.rotation_rate);
     num_dead_reckon_steps = 0;
   }
+
+  if (a->pulley.rotation_rate > 0) {
+    a->direction = DIRECTION_DOWN;
+  } else if (a->pulley.rotation_rate < 0) {
+    a->direction = DIRECTION_UP;
+  } else {
+    a->direction = DIRECTION_UNKNOWN;
+  }
+
+  if (datum_crossed(prev_position, a)) {
+    if (a->direction == DIRECTION_DOWN) {
+      a->pulley.rotations++;
+    } else if (a->direction == DIRECTION_UP) {
+      a->pulley.rotations--;
+    }
+    printf("%d rotations. d=%d\n", a->pulley.rotations, a->pulley.datum);
+  }
+
+  // Update the carriage vertical position
+  // TODO pick up here
 }
 
 void sample_as5600_task(void* params) {
+  actuator_t* actuator = (actuator_t*)params;
   esp_err_t ret = ESP_FAIL;
   uint16_t position = 0;  // angle encoded as a 12 bit value
-
-  actuator_t* actuator = (actuator_t*)params;
 
   while (true) {
     // TODO: time out after 2 master ticks
@@ -121,15 +171,19 @@ void sample_as5600_task(void* params) {
       ESP_LOGE("AS5600", "I2C timeout");
     } else if (ret == ESP_OK) {
       update_actuator(position, actuator);
-      ESP_LOGI("AS5600", "%d %.2f", actuator->pulley.position,
-               actuator->pulley.rotation_rate);
+      if (actuator->homed) {
+        ESP_LOGI("AS5600", "%d %.2f", actuator->pulley.position,
+                 actuator->pulley.rotation_rate);
+      }
     }
   }
 }
 
 void limit_switch_task(void* params) {
+  actuator_t* actuator = (actuator_t*)params;
   int pin_number = 0;
   int count = 0;
+
   while (true) {
     if (xQueueReceive(limit_switch_queue, &pin_number, portMAX_DELAY)) {
       // Disable limit switch ISR to prevent queuing garbage results during
@@ -139,10 +193,21 @@ void limit_switch_task(void* params) {
       // Interrupt handler logic
       if (gpio_get_level(pin_number) == 1) {
         count++;
-        ESP_LOGW("LIMIT_SWITCH", "Triggered %d %s since start. GPIO %d = %d",
-                 count, count == 1 ? "time" : "times", pin_number,
-                 gpio_get_level(pin_number));
         gpio_set_level(onboard_led_pin, 1);
+
+        // Home the actuator
+        // Set the rotation count to 1 as the carriage presses the limit switch
+        // down. As it rebounds upward, the pulley rotation will be negative
+        // and the rotation count will be decremented to zero as the datum is
+        // crossed.
+        bool already_homed = actuator->homed;
+        actuator->pulley.datum = actuator->pulley.position;
+        actuator->position = 0;
+        actuator->pulley.rotations = 1;
+        actuator->homed = true;
+
+        ESP_LOGI("LIMIT_SWITCH", "Trigger count = %d. datum = %d. %s", count,
+                 actuator->pulley.datum, already_homed ? "re-homed" : "homed");
       }
       vTaskDelay(pdMS_TO_TICKS(100));  // debounce delay
 
@@ -198,14 +263,6 @@ void configure_motor_pwm() {
 }
 
 void app_main() {
-  actuator_t actuator = {.pulley = {.position = -1,
-                                    .rotation_rate = 0,
-                                    .rotations = 0,
-                                    .radius = 1.5 /*cm*/},
-                         .position = -1,
-                         .speed = 0,
-                         .direction = DIRECTION_UNKNOWN};
-
   master_tick_signal = xSemaphoreCreateBinary();
 
   configure_onboard_led();
@@ -217,7 +274,8 @@ void app_main() {
   print_device_info();
   print_memory();
 
-  xTaskCreate(&limit_switch_task, "limit_switch_task", 2048, NULL, 5, NULL);
+  xTaskCreate(&limit_switch_task, "limit_switch_task", 2048, &actuator, 5,
+              NULL);
   xTaskCreate(&sample_as5600_task, "sample_as5600_task", 2048, &actuator, 2,
               NULL);
 
