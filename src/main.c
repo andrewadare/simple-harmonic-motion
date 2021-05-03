@@ -66,7 +66,7 @@ void filter_ema(const float alpha, const float x_meas, float* x_filt) {
 }
 
 // Return x wrapped into the interval [a, b)
-int wrap(const float x, const float a, const float b) {
+int wrap(const int x, const int a, const int b) {
   if (x < a) {
     return x + b - a;
   }
@@ -154,7 +154,11 @@ void update_actuator(const int position, actuator_t* a) {
   }
 
   // Update the carriage vertical position
-  // TODO pick up here
+  const int position_12bit =
+      -4096 * a->pulley.rotations -
+      wrap(a->pulley.position - a->pulley.datum, 0, 4096);
+
+  a->position = 6.2831853072 / 4096.0 * position_12bit * a->pulley.radius;
 }
 
 void sample_as5600_task(void* params) {
@@ -172,8 +176,8 @@ void sample_as5600_task(void* params) {
     } else if (ret == ESP_OK) {
       update_actuator(position, actuator);
       if (actuator->homed) {
-        ESP_LOGI("AS5600", "%d %.2f", actuator->pulley.position,
-                 actuator->pulley.rotation_rate);
+        ESP_LOGI("AS5600", "%d %.2f %.2f", actuator->pulley.position,
+                 actuator->pulley.rotation_rate, actuator->position);
       }
     }
   }
