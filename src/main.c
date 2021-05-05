@@ -8,6 +8,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "driver/ledc.h"
+#include "driver/mcpwm.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -30,6 +31,10 @@ static const gpio_num_t motor_pwm_pin = 4;
 static const gpio_num_t limit_switch_pin = 16;
 static const gpio_num_t as5600_sda = 18;
 static const gpio_num_t as5600_scl = 19;
+static const gpio_num_t MOTOR_PWM_PIN = 32;  // row 13
+static const gpio_num_t MOTOR_DIR_PIN = 33;  // row 12
+static const mcpwm_unit_t MOTOR_PWM_UNIT = MCPWM_UNIT_0;
+static const mcpwm_timer_t MOTOR_PWM_TIMER = MCPWM_TIMER_0;
 
 // Sets the target sample and update period of the overall system
 static const TickType_t update_period = pdMS_TO_TICKS(10);
@@ -262,6 +267,42 @@ void configure_motor_pwm() {
   ledc_fade_func_install(0);
 }
 
+static void mcpwm_task(void* arg) {
+  // Config and initialization
+  mcpwm_config_t pwm_config;
+  pwm_config.frequency = 20000;  // Hz,
+  pwm_config.cmpr_a = 0;         // duty cycle of PWMxA [%]
+  pwm_config.cmpr_b = 0;         // duty cycle of PWMxb
+  pwm_config.counter_mode = MCPWM_UP_COUNTER;
+  pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+  mcpwm_init(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, &pwm_config);
+  mcpwm_gpio_init(MOTOR_PWM_UNIT, MCPWM0A, MOTOR_PWM_PIN);
+
+  gpio_pad_select_gpio(MOTOR_DIR_PIN);
+  gpio_set_direction(MOTOR_DIR_PIN, GPIO_MODE_OUTPUT);
+
+  int direction = 0;
+  while (true) {
+    for (int i = 0; i < 100; i++) {
+      // printf("%.2f %d\n", (float)i, direction);
+      //   motor_go(direction, (float)i);
+      gpio_set_level(MOTOR_DIR_PIN, direction);
+      mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, i);
+
+      vTaskDelay(10 / portTICK_RATE_MS);
+    }
+    for (int i = 100; i > 0; i--) {
+      // printf("%.2f %d\n", (float)i, direction);
+      gpio_set_level(MOTOR_DIR_PIN, direction);
+      mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, i);
+
+      //   motor_go(direction, (float)i);
+      vTaskDelay(10 / portTICK_RATE_MS);
+    }
+    direction = !direction;
+  }
+}
+
 void app_main() {
   master_tick_signal = xSemaphoreCreateBinary();
 
@@ -274,10 +315,9 @@ void app_main() {
   print_device_info();
   print_memory();
 
-  xTaskCreate(&limit_switch_task, "limit_switch_task", 2048, &actuator, 5,
-              NULL);
-  xTaskCreate(&sample_as5600_task, "sample_as5600_task", 2048, &actuator, 2,
-              NULL);
+  xTaskCreate(&limit_switch_task, "limit_switch", 2048, &actuator, 5, NULL);
+  xTaskCreate(&sample_as5600_task, "as5600", 2048, &actuator, 3, NULL);
+  xTaskCreate(&mcpwm_task, "mcpwm", 2048, NULL, 2, NULL);
 
   TimerHandle_t master_timer = xTimerCreate("master_timer", update_period, true,
                                             NULL, &master_timer_callback);
