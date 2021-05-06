@@ -20,6 +20,7 @@
 #include "actuator.h"
 #include "chip_introspection.h"
 #include "i2c_comms.h"
+#include "pid_control.h"
 
 // I2C info for AMS AS5600 magnetic position sensor
 #define AS5600_ADDR 0x36
@@ -59,6 +60,15 @@ static actuator_t actuator = {.pulley = {.position = -1,
                               .speed = 0,
                               .direction = DIRECTION_UNKNOWN,
                               .homed = false};
+
+static pid_control_t pid = {.kp = 0.,
+                            .ki = 0.,
+                            .kd = 0.,
+                            .setpoint = 0.,
+                            .output = 0.,
+                            .min_output = 0.,
+                            .max_output = 0.,
+                            .error_sum = 0.};
 
 void master_timer_callback(TimerHandle_t timer) {
   xSemaphoreGive(master_tick_signal);
