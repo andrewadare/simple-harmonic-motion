@@ -1,19 +1,21 @@
-#include <stddef.h>
-
 #include "pid_control.h"
+
+#include <stddef.h>
 
 float clip(const float x, const float a, const float b) {
   return x < a ? a : x > b ? b : x;
 }
 
 void pid_update(const float input, const float ff, const float dt,
-                pid_control_t* pid) {
+                pid_control_t* pid, float* derivative) {
   static float* prev_input = NULL;
   const float e = pid->setpoint - input;  // the control error
 
-  // Derivative term - kicks in after the first call
+  // Contribution from error derivative de/dt
   float derivative_term = 0.;
-  if (prev_input) {
+  if (derivative) {
+    derivative_term = pid->kd * (*derivative);
+  } else if (prev_input) {
     // Omit d(setpoint)/dt from de/dt to keep output smooth
     derivative_term = pid->kd * (input - *prev_input) / dt;
   }

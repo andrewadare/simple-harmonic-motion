@@ -7,6 +7,7 @@ from collections import deque
 from time import time, sleep
 import re
 
+# Third party: pip install numpy, pyserial, gr
 import numpy as np
 import gr
 import serial
@@ -35,6 +36,12 @@ def get_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Select index of data to plot if multiple values are streamed in a line.",
+    )
+    ap.add_argument(
+        "--filter-pattern",
+        type=str,
+        default="",
+        help="Search pattern for filtering log messages",
     )
     return ap.parse_args()
 
@@ -110,7 +117,7 @@ class FakeDataGenerator:
         ser.write((str(self.x) + "\n").encode("utf-8"))
 
 
-def read_data(ser: serial.Serial, pattern: None) -> Union[str, None]:
+def read_data(ser: serial.Serial, pattern: str = "") -> Union[str, None]:
     line = ser.readline()
     try:
         line = line.decode()
@@ -119,7 +126,7 @@ def read_data(ser: serial.Serial, pattern: None) -> Union[str, None]:
         return None
     if len(line) == 0:
         return None
-    if pattern not in line:
+    if pattern and pattern not in line:
         print("Skipping line:", line)
         return None
     return line.strip()
@@ -154,13 +161,16 @@ def main():
         if args.simulate_data:
             generator.simulate_data(ser)
 
-        line = read_data(ser, "AS5600")
+        line = read_data(ser, args.filter_pattern)
         if line is None:
             print("Skipping serial data")
             continue
 
         # Find all numbers in line, whether int or float
-        s = re.findall(r"-?\d+\.?\d*", line.split("AS5600")[-1])
+        if args.filter_pattern:
+            s = re.findall(r"-?\d+\.?\d*", line.split(args.filter_pattern)[-1])
+        else:
+            s = re.findall(r"-?\d+\.?\d*", line)
 
         try:
             value = float(s[args.column])

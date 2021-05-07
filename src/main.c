@@ -30,6 +30,10 @@ static const gpio_num_t MOTOR_DIR_PIN = 33;  // row 12
 static const mcpwm_unit_t MOTOR_PWM_UNIT = MCPWM_UNIT_0;
 static const mcpwm_timer_t MOTOR_PWM_TIMER = MCPWM_TIMER_0;
 
+// If desired, calibrate to cm/tick, inches/tick, etc.
+static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
+static const char* POSITION_UNITS = "units";  // or "cm", "in", etc.
+
 // Sets the target sample and update period of the overall system
 static const TickType_t update_period = pdMS_TO_TICKS(10);
 
@@ -62,6 +66,12 @@ static actuator_t actuator = {.position = -1,
 
 void master_timer_callback(TimerHandle_t timer) {
   xSemaphoreGive(master_tick_signal);
+}
+
+// IIR filter using exponentially weighted moving average.
+// 0 <= alpha < 1 is a smoothing factor (larger -> smoother)
+void filter_ema(const float alpha, const float x_meas, float* x_filt) {
+  *x_filt = (1.0 - alpha) * x_meas + alpha * (*x_filt);
 }
 
 void limit_switch_task(void* params) {
@@ -151,17 +161,31 @@ static void motor_control_task(void* params) {
 
     // Query the encoder counter and update the actuator
     ESP_ERROR_CHECK(rotary_encoder_get_state(&encoder_info, &encoder_state));
+
+    // Instantaneous speed in position units per timestep
+    // (current - prev)
+    const float delta = POSITION_UNITS_PER_ENCODER_UNIT *
+                        (encoder_state.position - actuator->encoder_units);
+
     actuator->encoder_units = encoder_state.position;
+
     if (encoder_state.direction == ROTARY_ENCODER_DIRECTION_CLOCKWISE) {
-      actuator->direction = DIRECTION_DOWN;
+      actuator->direction = DIRECTION_UP;
     } else if (encoder_state.direction ==
                ROTARY_ENCODER_DIRECTION_COUNTER_CLOCKWISE) {
-      actuator->direction = DIRECTION_UP;
+      actuator->direction = DIRECTION_DOWN;
     }
-    // TODO: position, speed
 
-    ESP_LOGI("ENCODER", "%d %d", encoder_state.position,
-             encoder_state.direction);
+    // Update position and speed
+    if (actuator->homed) {
+      actuator->position = POSITION_UNITS_PER_ENCODER_UNIT *
+                           (actuator->encoder_units - actuator->datum);
+    }
+    filter_ema(0.7, delta, &actuator->speed);
+
+    ESP_LOGI("ENCODER", "%.2f %.2f %s %s", actuator->position, actuator->speed,
+             POSITION_UNITS,
+             actuator->direction == DIRECTION_UP ? "up" : "down");
 
     //   for (int i = 0; i < 100; i++) {
     //     // printf("%.2f %d\n", (float)i, direction);
