@@ -44,14 +44,12 @@ static void IRAM_ATTR limit_switch_isr(void* args) {
 
 // Parameters passed to FreeRTOS tasks must be either global
 // or heap-allocated.
-static actuator_t actuator = {.pulley = {.position = -1,
-                                         .datum = 0,
-                                         .rotation_rate = 0,
-                                         .rotations = 0,
-                                         .radius = 1.5 /*cm*/},
-                              .position = -1,
+static actuator_t actuator = {.position = -1,
                               .speed = 0,
                               .direction = DIRECTION_UNKNOWN,
+                              .pulley_radius = 1.5 /*cm*/,
+                              .encoder_units = 0,
+                              .datum = 0,
                               .homed = false};
 
 // static pid_control_t pid = {.kp = 0.,
@@ -106,13 +104,11 @@ void limit_switch_task(void* params) {
 
         // Home the actuator
         bool already_homed = actuator->homed;
-        actuator->pulley.datum = actuator->pulley.position;
-        actuator->position = 0;
-        actuator->pulley.rotations = 0;
+        actuator->datum = actuator->encoder_units;
         actuator->homed = true;
 
         ESP_LOGI("LIMIT_SWITCH", "Trigger count = %d. datum = %d. %s", count,
-                 actuator->pulley.datum, already_homed ? "re-homed" : "homed");
+                 actuator->datum, already_homed ? "re-homed" : "homed");
       }
       vTaskDelay(pdMS_TO_TICKS(100));  // debounce delay
 
@@ -124,7 +120,9 @@ void limit_switch_task(void* params) {
   }
 }
 
-static void motor_control_task(void* arg) {
+static void motor_control_task(void* params) {
+  actuator_t* actuator = (actuator_t*)params;
+
   // MCPWM config and initialization
   mcpwm_config_t pwm_config;
   pwm_config.frequency = 20000;  // Hz,
@@ -149,12 +147,19 @@ static void motor_control_task(void* arg) {
   // Swap definition of channel A <-> B so count increases upward
   ESP_ERROR_CHECK(rotary_encoder_flip_direction(&encoder_info));
 
-  // int direction = 0;
   while (true) {
     xSemaphoreTake(master_tick_signal, 2 * update_period);
 
-    // Poll the encoder
+    // Query the encoder counter and update the actuator
     ESP_ERROR_CHECK(rotary_encoder_get_state(&encoder_info, &encoder_state));
+    actuator->encoder_units = encoder_state.position;
+    if (encoder_state.direction == ROTARY_ENCODER_DIRECTION_CLOCKWISE) {
+      actuator->direction = DIRECTION_DOWN;
+    } else if (encoder_state.direction ==
+               ROTARY_ENCODER_DIRECTION_COUNTER_CLOCKWISE) {
+      actuator->direction = DIRECTION_UP;
+    }
+    // TODO: position, speed
 
     ESP_LOGI("ENCODER", "%d %d", encoder_state.position,
              encoder_state.direction);
@@ -189,7 +194,8 @@ void app_main() {
   ESP_ERROR_CHECK(gpio_install_isr_service(0));
 
   xTaskCreate(&limit_switch_task, "limit_switch", 2048, &actuator, 5, NULL);
-  xTaskCreate(&motor_control_task, "motor_control_task", 2048, NULL, 2, NULL);
+  xTaskCreate(&motor_control_task, "motor_control_task", 2048, &actuator, 2,
+              NULL);
 
   TimerHandle_t master_timer = xTimerCreate("master_timer", update_period, true,
                                             NULL, &master_timer_callback);
