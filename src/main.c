@@ -47,7 +47,6 @@ static void IRAM_ATTR limit_switch_isr(void* args) {
 static actuator_t actuator = {.position = -1,
                               .speed = 0,
                               .direction = DIRECTION_UNKNOWN,
-                              .pulley_radius = 1.5 /*cm*/,
                               .encoder_units = 0,
                               .datum = 0,
                               .homed = false};

@@ -12,10 +12,9 @@ typedef enum {
 typedef struct {
   float position;                  // cm above limit switch
   float speed;                     // cm/s, positive upward
-  actuator_direction_t direction;  // linear up/down direction
-  float pulley_radius;             // [cm] Half pitch diam.
-  int encoder_units;               // position in encoder ticks
-  int datum;                       // encoder ticks at low point
+  actuator_direction_t direction;  // up/down
+  int encoder_units;               // encoder position
+  int datum;                       // "" at low point
   bool homed;                      // limit switch contacted
 } actuator_t;
 
