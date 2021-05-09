@@ -1,4 +1,3 @@
-// TODO: use a mutex semaphore for UART traffic
 
 // Builtins
 #include <math.h>
@@ -23,8 +22,8 @@
 // Pin assignments on ESP32 dev board (NodeMCU-32S)
 static const gpio_num_t ONBOARD_LED_PIN = 2;
 static const gpio_num_t LIMIT_SWITCH_PIN = 16;
-static const gpio_num_t ENCODER_PIN_A = 25;
-static const gpio_num_t ENCODER_PIN_B = 26;
+static const gpio_num_t ENCODER_PIN_A = 22;
+static const gpio_num_t ENCODER_PIN_B = 23;
 static const gpio_num_t MOTOR_PWM_PIN = 32;  // row 13
 static const gpio_num_t MOTOR_DIR_PIN = 33;  // row 12
 static const mcpwm_unit_t MOTOR_PWM_UNIT = MCPWM_UNIT_0;
@@ -40,6 +39,7 @@ static const TickType_t update_period = pdMS_TO_TICKS(10);
 static xQueueHandle limit_switch_queue;
 
 xSemaphoreHandle master_tick_signal;
+xSemaphoreHandle uart_mutex;
 
 static void IRAM_ATTR limit_switch_isr(void* args) {
   int pin_number = (int)args;
@@ -74,6 +74,29 @@ void filter_ema(const float alpha, const float x_meas, float* x_filt) {
   *x_filt = (1.0 - alpha) * x_meas + alpha * (*x_filt);
 }
 
+static void update_actuator_data(int encoder_position,
+                                 rotary_encoder_direction_t encoder_direction,
+                                 actuator_t* actuator) {
+  // Instantaneous speed (current - prev) in position units per timestep
+  const float delta = POSITION_UNITS_PER_ENCODER_UNIT *
+                      (encoder_position - actuator->encoder_units);
+
+  actuator->encoder_units = encoder_position;
+
+  if (encoder_direction == ROTARY_ENCODER_DIRECTION_CLOCKWISE) {
+    actuator->direction = DIRECTION_UP;
+  } else if (encoder_direction == ROTARY_ENCODER_DIRECTION_COUNTER_CLOCKWISE) {
+    actuator->direction = DIRECTION_DOWN;
+  }
+
+  // Update position and speed
+  if (actuator->homed) {
+    actuator->position = POSITION_UNITS_PER_ENCODER_UNIT *
+                         (actuator->encoder_units - actuator->datum);
+  }
+  filter_ema(0.7, delta, &actuator->speed);
+}
+
 void limit_switch_task(void* params) {
   actuator_t* actuator = (actuator_t*)params;
   int pin_number = 0;
@@ -95,8 +118,6 @@ void limit_switch_task(void* params) {
 
   limit_switch_queue = xQueueCreate(1, sizeof(int));
 
-  // ESP_ERROR_CHECK(gpio_install_isr_service(0));
-
   gpio_isr_handler_add(LIMIT_SWITCH_PIN, limit_switch_isr,
                        (void*)LIMIT_SWITCH_PIN);
 
@@ -116,8 +137,11 @@ void limit_switch_task(void* params) {
         actuator->datum = actuator->encoder_units;
         actuator->homed = true;
 
-        ESP_LOGI("LIMIT_SWITCH", "Trigger count = %d. datum = %d. %s", count,
-                 actuator->datum, already_homed ? "re-homed" : "homed");
+        if (xSemaphoreTake(uart_mutex, 100 / portTICK_PERIOD_MS)) {
+          ESP_LOGI("LIMIT_SWITCH", "Trigger count = %d. datum = %d. %s", count,
+                   actuator->datum, already_homed ? "re-homed" : "homed");
+          xSemaphoreGive(uart_mutex);
+        }
       }
       vTaskDelay(pdMS_TO_TICKS(100));  // debounce delay
 
@@ -154,7 +178,9 @@ static void motor_control_task(void* params) {
       rotary_encoder_init(&encoder_info, ENCODER_PIN_A, ENCODER_PIN_B));
 
   // Swap definition of channel A <-> B so count increases upward
-  ESP_ERROR_CHECK(rotary_encoder_flip_direction(&encoder_info));
+  // ESP_ERROR_CHECK(rotary_encoder_flip_direction(&encoder_info));
+
+  int count = 0;  // tmp
 
   while (true) {
     xSemaphoreTake(master_tick_signal, 2 * update_period);
@@ -162,53 +188,38 @@ static void motor_control_task(void* params) {
     // Query the encoder counter and update the actuator
     ESP_ERROR_CHECK(rotary_encoder_get_state(&encoder_info, &encoder_state));
 
-    // Instantaneous speed in position units per timestep
-    // (current - prev)
-    const float delta = POSITION_UNITS_PER_ENCODER_UNIT *
-                        (encoder_state.position - actuator->encoder_units);
+    update_actuator_data(encoder_state.position, encoder_state.direction,
+                         actuator);
 
-    actuator->encoder_units = encoder_state.position;
+    // Homing
+    while (!actuator->homed) {
+      gpio_set_level(MOTOR_DIR_PIN, DIRECTION_DOWN);
+      mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 25.0);
+      vTaskDelay(10 / portTICK_RATE_MS);
+    }
+    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 0.0);
 
-    if (encoder_state.direction == ROTARY_ENCODER_DIRECTION_CLOCKWISE) {
-      actuator->direction = DIRECTION_UP;
-    } else if (encoder_state.direction ==
-               ROTARY_ENCODER_DIRECTION_COUNTER_CLOCKWISE) {
-      actuator->direction = DIRECTION_DOWN;
+    if (count == 0 && actuator->homed && actuator->position > 2000 &&
+        actuator->position < 4000) {
+      gpio_set_level(MOTOR_DIR_PIN, DIRECTION_UP);  // actuator_t: down=0, up=1
+      mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 20.0);
+      vTaskDelay(500 / portTICK_RATE_MS);
+      mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 0.0);
+      count = 1;
     }
 
-    // Update position and speed
-    if (actuator->homed) {
-      actuator->position = POSITION_UNITS_PER_ENCODER_UNIT *
-                           (actuator->encoder_units - actuator->datum);
+    if (xSemaphoreTake(uart_mutex, 2 / portTICK_PERIOD_MS)) {
+      ESP_LOGI("ENCODER", "%.2f %.2f %s %s", actuator->position,
+               actuator->speed, POSITION_UNITS,
+               actuator->direction == DIRECTION_UP ? "up" : "down");
+      xSemaphoreGive(uart_mutex);
     }
-    filter_ema(0.7, delta, &actuator->speed);
-
-    ESP_LOGI("ENCODER", "%.2f %.2f %s %s", actuator->position, actuator->speed,
-             POSITION_UNITS,
-             actuator->direction == DIRECTION_UP ? "up" : "down");
-
-    //   for (int i = 0; i < 100; i++) {
-    //     // printf("%.2f %d\n", (float)i, direction);
-    //     //   motor_go(direction, (float)i);
-    //     gpio_set_level(MOTOR_DIR_PIN, direction);
-    //     mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, i);
-
-    //     vTaskDelay(10 / portTICK_RATE_MS);
-    //   }
-    //   for (int i = 100; i > 0; i--) {
-    //     // printf("%.2f %d\n", (float)i, direction);
-    //     gpio_set_level(MOTOR_DIR_PIN, direction);
-    //     mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, i);
-
-    //     //   motor_go(direction, (float)i);
-    //     vTaskDelay(10 / portTICK_RATE_MS);
-    //   }
-    //   direction = !direction;
   }
 }
 
 void app_main() {
   master_tick_signal = xSemaphoreCreateBinary();
+  uart_mutex = xSemaphoreCreateMutex();
 
   vTaskDelay(pdMS_TO_TICKS(500));
   print_device_info();
