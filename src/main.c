@@ -31,13 +31,14 @@ static const mcpwm_timer_t MOTOR_PWM_TIMER = MCPWM_TIMER_0;
 
 // If desired, calibrate to cm/tick, inches/tick, etc.
 static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
-static const char* POSITION_UNITS = "units";  // or "cm", "in", etc.
+static const char* POSITION_UNITS = "encoder pulses";
+static const float ACTUATOR_HEIGHT = 5000.;
 
-// Sets the target sample and update period of the overall system
 static const TickType_t update_period = pdMS_TO_TICKS(10);
+static const TickType_t bounce_period = pdMS_TO_TICKS(1000);
 
+// For inter-task communication
 static xQueueHandle limit_switch_queue;
-
 xSemaphoreHandle master_tick_signal;
 xSemaphoreHandle uart_mutex;
 
@@ -97,6 +98,32 @@ static void update_actuator_data(int encoder_position,
   filter_ema(0.7, delta, &actuator->speed);
 }
 
+esp_err_t home_actuator(rotary_encoder_info_t* encoder_info,
+                        rotary_encoder_state_t* encoder_state,
+                        actuator_t* actuator) {
+  while (!actuator->homed) {
+    ESP_ERROR_CHECK(rotary_encoder_get_state(encoder_info, encoder_state));
+
+    update_actuator_data(encoder_state->position, encoder_state->direction,
+                         actuator);
+    gpio_set_level(MOTOR_DIR_PIN, DIRECTION_DOWN);
+    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 30.0);
+    vTaskDelay(update_period);
+  }
+
+  // Bring actuator to center
+  // TODO: closed-loop control
+  gpio_set_level(MOTOR_DIR_PIN, DIRECTION_UP);
+  while (actuator->position < ACTUATOR_HEIGHT / 2) {
+    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 30.0);
+    vTaskDelay(update_period);
+  }
+
+  mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 0.0);
+
+  return ESP_OK;
+}
+
 void limit_switch_task(void* params) {
   actuator_t* actuator = (actuator_t*)params;
   int pin_number = 0;
@@ -132,7 +159,7 @@ void limit_switch_task(void* params) {
         count++;
         gpio_set_level(ONBOARD_LED_PIN, 1);
 
-        // Home the actuator
+        // Change actuator state to homed
         bool already_homed = actuator->homed;
         actuator->datum = actuator->encoder_units;
         actuator->homed = true;
@@ -180,7 +207,9 @@ static void motor_control_task(void* params) {
   // Swap definition of channel A <-> B so count increases upward
   // ESP_ERROR_CHECK(rotary_encoder_flip_direction(&encoder_info));
 
-  int count = 0;  // tmp
+  if (home_actuator(&encoder_info, &encoder_state, actuator) != ESP_OK) {
+    ESP_LOGE("HOMING", "Failure");
+  }
 
   while (true) {
     xSemaphoreTake(master_tick_signal, 2 * update_period);
@@ -191,22 +220,7 @@ static void motor_control_task(void* params) {
     update_actuator_data(encoder_state.position, encoder_state.direction,
                          actuator);
 
-    // Homing
-    while (!actuator->homed) {
-      gpio_set_level(MOTOR_DIR_PIN, DIRECTION_DOWN);
-      mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 25.0);
-      vTaskDelay(10 / portTICK_RATE_MS);
-    }
-    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 0.0);
-
-    if (count == 0 && actuator->homed && actuator->position > 2000 &&
-        actuator->position < 4000) {
-      gpio_set_level(MOTOR_DIR_PIN, DIRECTION_UP);  // actuator_t: down=0, up=1
-      mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 20.0);
-      vTaskDelay(500 / portTICK_RATE_MS);
-      mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 0.0);
-      count = 1;
-    }
+    // TODO: PID control here
 
     if (xSemaphoreTake(uart_mutex, 2 / portTICK_PERIOD_MS)) {
       ESP_LOGI("ENCODER", "%.2f %.2f %s %s", actuator->position,
@@ -233,5 +247,8 @@ void app_main() {
 
   TimerHandle_t master_timer = xTimerCreate("master_timer", update_period, true,
                                             NULL, &master_timer_callback);
+  TimerHandle_t bounce_timer =
+      xTimerCreate("bounce_timer", bounce_period, true, NULL, NULL);
+
   xTimerStart(master_timer, 0);
 }
