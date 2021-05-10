@@ -33,13 +33,14 @@ static const mcpwm_timer_t MOTOR_PWM_TIMER = MCPWM_TIMER_0;
 // TODO: provide bounce parameters as user input
 static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
 // static const char* POSITION_UNITS = "encoder pulses";  // unused
-static const float ACTUATOR_HEIGHT = 5000.;
-static const float REFERENCE_HEIGHT = ACTUATOR_HEIGHT / 2;
-static const float BOUNCE_AMPLITUDE = 200.0;
+static const float ACTUATOR_HEIGHT = 7500.;
+static const float REFERENCE_HEIGHT = 0.4 * ACTUATOR_HEIGHT;
+static const float BOUNCE_AMPLITUDE = 1500.0;
+static const float AMPLITUDE_RAMP_RATE = 0.5;  // pos. units / timestep
 static const TickType_t update_period = pdMS_TO_TICKS(10);
 
-// Angular frequency in Hz (omega = 2 pi f)
-static const float BOUNCE_FREQUENCY = 2 * M_PI * 1.;
+static const float BOUNCE_PERIOD = 1.5;  // seconds
+static const float BOUNCE_FREQUENCY = 2 * M_PI / BOUNCE_PERIOD;
 
 // For inter-task communication
 static xQueueHandle limit_switch_queue;
@@ -60,7 +61,7 @@ static actuator_t actuator = {.position = 0,
                               .datum = 0,
                               .homed = false};
 
-static pid_control_t pid = {.kp = 0.01,
+static pid_control_t pid = {.kp = 0.005,
                             .ki = 0.0,
                             .kd = 0.001,
                             .setpoint = 0.,
@@ -81,9 +82,8 @@ void filter_ema(const float alpha, const float x_meas, float* x_filt) {
   *x_filt = (1.0 - alpha) * x_meas + alpha * (*x_filt);
 }
 
-static float bounce_setpoint(const float t_ms) {
-  return REFERENCE_HEIGHT +
-         BOUNCE_AMPLITUDE * sin(BOUNCE_FREQUENCY * t_ms / 1000.);
+static float bounce_setpoint(const float t_ms, const float amplitude) {
+  return REFERENCE_HEIGHT + amplitude * sin(BOUNCE_FREQUENCY * t_ms / 1000.);
 }
 
 static void update_actuator_data(int encoder_position,
@@ -234,6 +234,8 @@ static void motor_control_task(void* params) {
 
   int64_t start_time = esp_timer_get_time();  // microseconds
 
+  float amplitude = 0;
+
   while (true) {
     xSemaphoreTake(master_tick_signal, 2 * update_period);
 
@@ -243,7 +245,12 @@ static void motor_control_task(void* params) {
                          actuator);
 
     const float t_ms = (esp_timer_get_time() - start_time) / 1000.;
-    pid.setpoint = bounce_setpoint(t_ms);
+
+    // Ramp towards BOUNCE_AMPLITUDE at the assigned ramp rate
+    if (amplitude < BOUNCE_AMPLITUDE) {
+      amplitude += AMPLITUDE_RAMP_RATE;
+    }
+    pid.setpoint = bounce_setpoint(t_ms, amplitude);
 
     // Compute PID output
     const float dxdt = actuator->speed / pdTICKS_TO_MS(update_period);
