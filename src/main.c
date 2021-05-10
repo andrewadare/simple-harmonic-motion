@@ -30,12 +30,16 @@ static const mcpwm_unit_t MOTOR_PWM_UNIT = MCPWM_UNIT_0;
 static const mcpwm_timer_t MOTOR_PWM_TIMER = MCPWM_TIMER_0;
 
 // If desired, calibrate to cm/tick, inches/tick, etc.
+// TODO: provide bounce parameters as user input
 static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
 static const char* POSITION_UNITS = "encoder pulses";
 static const float ACTUATOR_HEIGHT = 5000.;
-
+static const float REFERENCE_HEIGHT = ACTUATOR_HEIGHT / 2;
+static const float BOUNCE_AMPLITUDE = 50.0;
 static const TickType_t update_period = pdMS_TO_TICKS(10);
-static const TickType_t bounce_period = pdMS_TO_TICKS(1000);
+
+// Angular frequency in Hz (omega = 2 pi f)
+static const float BOUNCE_FREQUENCY = 2 * M_PI * 1.;
 
 // For inter-task communication
 static xQueueHandle limit_switch_queue;
@@ -49,21 +53,21 @@ static void IRAM_ATTR limit_switch_isr(void* args) {
 
 // Parameters passed to FreeRTOS tasks must be either global
 // or heap-allocated.
-static actuator_t actuator = {.position = -1,
+static actuator_t actuator = {.position = 0,
                               .speed = 0,
                               .direction = DIRECTION_UNKNOWN,
                               .encoder_units = 0,
                               .datum = 0,
                               .homed = false};
 
-// static pid_control_t pid = {.kp = 0.,
-//                             .ki = 0.,
-//                             .kd = 0.,
-//                             .setpoint = 0.,
-//                             .output = 0.,
-//                             .min_output = 0.,
-//                             .max_output = 0.,
-//                             .error_sum = 0.};
+static pid_control_t pid = {.kp = 0.,
+                            .ki = 0.,
+                            .kd = 0.,
+                            .setpoint = 0.,
+                            .output = 0.,
+                            .min_output = -1.0,
+                            .max_output = +1.0,
+                            .error_sum = 0.};
 
 void master_timer_callback(TimerHandle_t timer) {
   xSemaphoreGive(master_tick_signal);
@@ -73,6 +77,11 @@ void master_timer_callback(TimerHandle_t timer) {
 // 0 <= alpha < 1 is a smoothing factor (larger -> smoother)
 void filter_ema(const float alpha, const float x_meas, float* x_filt) {
   *x_filt = (1.0 - alpha) * x_meas + alpha * (*x_filt);
+}
+
+static float bounce_setpoint(const float t_ms) {
+  return REFERENCE_HEIGHT +
+         BOUNCE_AMPLITUDE * sin(BOUNCE_FREQUENCY * t_ms / 1000.);
 }
 
 static void update_actuator_data(int encoder_position,
@@ -101,6 +110,7 @@ static void update_actuator_data(int encoder_position,
 esp_err_t home_actuator(rotary_encoder_info_t* encoder_info,
                         rotary_encoder_state_t* encoder_state,
                         actuator_t* actuator) {
+  // TODO: error reporting/handling
   while (!actuator->homed) {
     ESP_ERROR_CHECK(rotary_encoder_get_state(encoder_info, encoder_state));
 
@@ -114,10 +124,15 @@ esp_err_t home_actuator(rotary_encoder_info_t* encoder_info,
   // Bring actuator to center
   // TODO: closed-loop control
   gpio_set_level(MOTOR_DIR_PIN, DIRECTION_UP);
-  while (actuator->position < ACTUATOR_HEIGHT / 2) {
+  while (actuator->position < REFERENCE_HEIGHT) {
+    ESP_ERROR_CHECK(rotary_encoder_get_state(encoder_info, encoder_state));
+
+    update_actuator_data(encoder_state->position, encoder_state->direction,
+                         actuator);
     mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 30.0);
     vTaskDelay(update_period);
   }
+  ESP_LOGD("HOMING", "Homing complete! At reference point.");
 
   mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 0.0);
 
@@ -204,27 +219,24 @@ static void motor_control_task(void* params) {
   ESP_ERROR_CHECK(
       rotary_encoder_init(&encoder_info, ENCODER_PIN_A, ENCODER_PIN_B));
 
-  // Swap definition of channel A <-> B so count increases upward
-  // ESP_ERROR_CHECK(rotary_encoder_flip_direction(&encoder_info));
+  ESP_ERROR_CHECK(home_actuator(&encoder_info, &encoder_state, actuator));
 
-  if (home_actuator(&encoder_info, &encoder_state, actuator) != ESP_OK) {
-    ESP_LOGE("HOMING", "Failure");
-  }
+  int64_t start_time = esp_timer_get_time();  // microseconds
 
   while (true) {
     xSemaphoreTake(master_tick_signal, 2 * update_period);
 
-    // Query the encoder counter and update the actuator
+    // Sensor update
     ESP_ERROR_CHECK(rotary_encoder_get_state(&encoder_info, &encoder_state));
-
     update_actuator_data(encoder_state.position, encoder_state.direction,
                          actuator);
 
-    // TODO: PID control here
+    const float t_ms = (esp_timer_get_time() - start_time) / 1000.;
+    pid.setpoint = bounce_setpoint(t_ms);
 
     if (xSemaphoreTake(uart_mutex, 2 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("ENCODER", "%.2f %.2f %s %s", actuator->position,
-               actuator->speed, POSITION_UNITS,
+      ESP_LOGI("ENCODER", "%.2f %.2f %.2f %s %s", actuator->position,
+               actuator->speed, pid.setpoint, POSITION_UNITS,
                actuator->direction == DIRECTION_UP ? "up" : "down");
       xSemaphoreGive(uart_mutex);
     }
@@ -232,6 +244,8 @@ static void motor_control_task(void* params) {
 }
 
 void app_main() {
+  esp_log_level_set("TESTING", ESP_LOG_VERBOSE);  // everything
+
   master_tick_signal = xSemaphoreCreateBinary();
   uart_mutex = xSemaphoreCreateMutex();
 
@@ -247,8 +261,6 @@ void app_main() {
 
   TimerHandle_t master_timer = xTimerCreate("master_timer", update_period, true,
                                             NULL, &master_timer_callback);
-  TimerHandle_t bounce_timer =
-      xTimerCreate("bounce_timer", bounce_period, true, NULL, NULL);
 
   xTimerStart(master_timer, 0);
 }
