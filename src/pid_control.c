@@ -7,7 +7,7 @@ float clip(const float x, const float a, const float b) {
 }
 
 void pid_update(const float input, const float ff, const float dt,
-                pid_control_t* pid, float* derivative) {
+                pid_control_t* pid, const float* derivative) {
   // Update control error
   pid->error = pid->setpoint - input;
 

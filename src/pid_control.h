@@ -25,6 +25,6 @@ float clip(const float x, const float a, const float b);
 // If an error derivative de/dt is supplied (i.e. not NULL), it will be used
 // in place of the internal calculation.
 void pid_update(const float input, const float ff, const float dt,
-                pid_control_t* pid, float* derivative);
+                pid_control_t* pid, const float* derivative);
 
 #endif /* PID_CONTROL_H */
