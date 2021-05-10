@@ -9,9 +9,11 @@ typedef struct {
 
   // Configuration and state variables
   float setpoint;
+  float input;
   float output;
   float min_output;
   float max_output;
+  float error;
   float error_sum;
 } pid_control_t;
 

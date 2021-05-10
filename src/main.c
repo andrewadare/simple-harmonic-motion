@@ -32,7 +32,7 @@ static const mcpwm_timer_t MOTOR_PWM_TIMER = MCPWM_TIMER_0;
 // If desired, calibrate to cm/tick, inches/tick, etc.
 // TODO: provide bounce parameters as user input
 static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
-static const char* POSITION_UNITS = "encoder pulses";
+// static const char* POSITION_UNITS = "encoder pulses";  // unused
 static const float ACTUATOR_HEIGHT = 5000.;
 static const float REFERENCE_HEIGHT = ACTUATOR_HEIGHT / 2;
 static const float BOUNCE_AMPLITUDE = 50.0;
@@ -60,13 +60,15 @@ static actuator_t actuator = {.position = 0,
                               .datum = 0,
                               .homed = false};
 
-static pid_control_t pid = {.kp = 0.,
+static pid_control_t pid = {.kp = 0.1,
                             .ki = 0.,
                             .kd = 0.,
                             .setpoint = 0.,
+                            .input = 0.,
                             .output = 0.,
                             .min_output = -1.0,
                             .max_output = +1.0,
+                            .error = 0.,
                             .error_sum = 0.};
 
 void master_timer_callback(TimerHandle_t timer) {
@@ -234,9 +236,12 @@ static void motor_control_task(void* params) {
     const float t_ms = (esp_timer_get_time() - start_time) / 1000.;
     pid.setpoint = bounce_setpoint(t_ms);
 
+    // Compute PID output
+    pid_update(actuator->position, 0., 1, &pid, NULL);
+
     if (xSemaphoreTake(uart_mutex, 2 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("ENCODER", "%.2f %.2f %.2f %s %s", actuator->position,
-               actuator->speed, pid.setpoint, POSITION_UNITS,
+      ESP_LOGI("ENCODER", "%.2f %.2f %.2f %.2f %s", actuator->position,
+               actuator->speed, pid.setpoint, pid.output,
                actuator->direction == DIRECTION_UP ? "up" : "down");
       xSemaphoreGive(uart_mutex);
     }
