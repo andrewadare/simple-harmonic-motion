@@ -35,7 +35,7 @@ static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
 // static const char* POSITION_UNITS = "encoder pulses";  // unused
 static const float ACTUATOR_HEIGHT = 5000.;
 static const float REFERENCE_HEIGHT = ACTUATOR_HEIGHT / 2;
-static const float BOUNCE_AMPLITUDE = 50.0;
+static const float BOUNCE_AMPLITUDE = 200.0;
 static const TickType_t update_period = pdMS_TO_TICKS(10);
 
 // Angular frequency in Hz (omega = 2 pi f)
@@ -60,9 +60,9 @@ static actuator_t actuator = {.position = 0,
                               .datum = 0,
                               .homed = false};
 
-static pid_control_t pid = {.kp = 0.1,
-                            .ki = 0.,
-                            .kd = 0.,
+static pid_control_t pid = {.kp = 0.01,
+                            .ki = 0.0,
+                            .kd = 0.001,
                             .setpoint = 0.,
                             .input = 0.,
                             .output = 0.,
@@ -107,6 +107,15 @@ static void update_actuator_data(int encoder_position,
                          (actuator->encoder_units - actuator->datum);
   }
   filter_ema(0.7, delta, &actuator->speed);
+}
+
+// Expecting -1.0 <= PID output <= +1.0
+static void go(const float pid_output) {
+  const int gpio_level = pid_output < 0 ? DIRECTION_DOWN : DIRECTION_UP;
+  const float duty_percent = 100. * fabs(pid_output);
+
+  gpio_set_level(MOTOR_DIR_PIN, gpio_level);
+  mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, duty_percent);
 }
 
 esp_err_t home_actuator(rotary_encoder_info_t* encoder_info,
@@ -237,10 +246,13 @@ static void motor_control_task(void* params) {
     pid.setpoint = bounce_setpoint(t_ms);
 
     // Compute PID output
-    pid_update(actuator->position, 0., 1, &pid, NULL);
+    const float dxdt = actuator->speed / pdTICKS_TO_MS(update_period);
+    pid_update(actuator->position, 0., 1, &pid, &dxdt);
+
+    go(pid.output);
 
     if (xSemaphoreTake(uart_mutex, 2 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("ENCODER", "%.2f %.2f %.2f %.2f %s", actuator->position,
+      ESP_LOGI("ACTUATOR", "%.2f %.2f %.2f %.2f %s", actuator->position,
                actuator->speed, pid.setpoint, pid.output,
                actuator->direction == DIRECTION_UP ? "up" : "down");
       xSemaphoreGive(uart_mutex);
