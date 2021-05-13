@@ -16,7 +16,7 @@
 // local
 #include "actuator.h"
 #include "chip_introspection.h"
-#include "pid_control.h"
+// #include "pid_control.h"
 #include "rotary_encoder.h"
 
 // Pin assignments on ESP32 dev board (NodeMCU-32S)
@@ -36,11 +36,11 @@ static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
 static const float ACTUATOR_HEIGHT = 7500.;
 static const float REFERENCE_HEIGHT = 0.4 * ACTUATOR_HEIGHT;
 static const float BOUNCE_AMPLITUDE = 1500.0;
-static const float AMPLITUDE_RAMP_RATE = 0.5;  // pos. units / timestep
+// static const float AMPLITUDE_RAMP_RATE = 0.5;  // pos. units / timestep
 static const TickType_t update_period = pdMS_TO_TICKS(10);
 
-static const float BOUNCE_PERIOD = 1.5;  // seconds
-static const float BOUNCE_FREQUENCY = 2 * M_PI / BOUNCE_PERIOD;
+// static const float BOUNCE_PERIOD = 1.5;  // seconds
+// static const float BOUNCE_FREQUENCY = 2 * M_PI / BOUNCE_PERIOD;
 
 // For inter-task communication
 static xQueueHandle limit_switch_queue;
@@ -61,16 +61,16 @@ static actuator_t actuator = {.position = 0,
                               .datum = 0,
                               .homed = false};
 
-static pid_control_t pid = {.kp = 0.005,
-                            .ki = 0.0,
-                            .kd = 0.001,
-                            .setpoint = 0.,
-                            .input = 0.,
-                            .output = 0.,
-                            .min_output = -1.0,
-                            .max_output = +1.0,
-                            .error = 0.,
-                            .error_sum = 0.};
+// static pid_control_t pid = {.kp = 0.005,
+//                             .ki = 0.0,
+//                             .kd = 0.001,
+//                             .setpoint = 0.,
+//                             .input = 0.,
+//                             .output = 0.,
+//                             .min_output = -1.0,
+//                             .max_output = +1.0,
+//                             .error = 0.,
+//                             .error_sum = 0.};
 
 void master_timer_callback(TimerHandle_t timer) {
   xSemaphoreGive(master_tick_signal);
@@ -82,9 +82,9 @@ void filter_ema(const float alpha, const float x_meas, float* x_filt) {
   *x_filt = (1.0 - alpha) * x_meas + alpha * (*x_filt);
 }
 
-static float bounce_setpoint(const float t_ms, const float amplitude) {
-  return REFERENCE_HEIGHT + amplitude * sin(BOUNCE_FREQUENCY * t_ms / 1000.);
-}
+// static float bounce_setpoint(const float t_ms, const float amplitude) {
+//   return REFERENCE_HEIGHT + amplitude * sin(BOUNCE_FREQUENCY * t_ms / 1000.);
+// }
 
 static void update_actuator_data(int encoder_position,
                                  rotary_encoder_direction_t encoder_direction,
@@ -232,35 +232,68 @@ static void motor_control_task(void* params) {
 
   ESP_ERROR_CHECK(home_actuator(&encoder_info, &encoder_state, actuator));
 
-  int64_t start_time = esp_timer_get_time();  // microseconds
+  // int64_t start_time = esp_timer_get_time();  // microseconds
 
-  float amplitude = 0;
+  float amplitude = 0.;
+  float prev_speed = 0.;
+  float low_point = 0., high_point = 0.;
+  bool low_point_defined = false;
+  bool high_point_defined = false;
 
   while (true) {
     xSemaphoreTake(master_tick_signal, 2 * update_period);
 
     // Sensor update
+    prev_speed = actuator->speed;
     ESP_ERROR_CHECK(rotary_encoder_get_state(&encoder_info, &encoder_state));
     update_actuator_data(encoder_state.position, encoder_state.direction,
                          actuator);
 
-    const float t_ms = (esp_timer_get_time() - start_time) / 1000.;
+    // Find extrema by polling for velocity sign changes above the limit switch
+    if (prev_speed < 0 && actuator->speed >= 0 && actuator->position > 0.) {
+      low_point = actuator->position;
+      low_point_defined = true;
+    }
+    if (prev_speed > 0 && actuator->speed <= 0 && actuator->position > 0.) {
+      high_point = actuator->position;
+      high_point_defined = true;
+    }
+
+    // const float t_ms = (esp_timer_get_time() - start_time) / 1000.;
 
     // Ramp towards BOUNCE_AMPLITUDE at the assigned ramp rate
-    if (amplitude < BOUNCE_AMPLITUDE) {
-      amplitude += AMPLITUDE_RAMP_RATE;
+    // if (amplitude < BOUNCE_AMPLITUDE) {
+    //   amplitude += AMPLITUDE_RAMP_RATE;
+    // }
+
+    if (low_point_defined && high_point_defined) {
+      amplitude = fmin(BOUNCE_AMPLITUDE, 0.5 * (high_point - low_point));
+
+      if (actuator->position > REFERENCE_HEIGHT - 0.5 * amplitude &&
+          actuator->position < REFERENCE_HEIGHT + 0.5 * amplitude) {
+        go(actuator->speed >= 0 ? +1.0 : -1.0);
+      } else {
+        go(0.);
+      }
     }
-    pid.setpoint = bounce_setpoint(t_ms, amplitude);
+
+    // pid.setpoint = bounce_setpoint(t_ms, amplitude);
 
     // Compute PID output
-    const float dxdt = actuator->speed / pdTICKS_TO_MS(update_period);
-    pid_update(actuator->position, 0., 1, &pid, &dxdt);
+    // const float dxdt = actuator->speed / pdTICKS_TO_MS(update_period);
+    // pid_update(actuator->position, 0., 1, &pid, &dxdt);
+    // go(pid.output);
 
-    go(pid.output);
+    // if (xSemaphoreTake(uart_mutex, 2 / portTICK_PERIOD_MS)) {
+    //   ESP_LOGI("ACTUATOR", "%.2f %.2f %.2f %.2f %s", actuator->position,
+    //            actuator->speed, pid.setpoint, pid.output,
+    //            actuator->direction == DIRECTION_UP ? "up" : "down");
+    //   xSemaphoreGive(uart_mutex);
+    // }
 
     if (xSemaphoreTake(uart_mutex, 2 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("ACTUATOR", "%.2f %.2f %.2f %.2f %s", actuator->position,
-               actuator->speed, pid.setpoint, pid.output,
+      ESP_LOGI("ACTUATOR", "%.2f %.2f %.2f %s", actuator->position,
+               actuator->speed, amplitude,
                actuator->direction == DIRECTION_UP ? "up" : "down");
       xSemaphoreGive(uart_mutex);
     }
