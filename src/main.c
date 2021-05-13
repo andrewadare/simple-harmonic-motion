@@ -35,7 +35,7 @@ static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
 // static const char* POSITION_UNITS = "encoder pulses";  // unused
 static const float ACTUATOR_HEIGHT = 7500.;
 static const float REFERENCE_HEIGHT = 0.4 * ACTUATOR_HEIGHT;
-static const float BOUNCE_AMPLITUDE = 1500.0;
+// static const float BOUNCE_AMPLITUDE = 1500.0;
 // static const float AMPLITUDE_RAMP_RATE = 0.5;  // pos. units / timestep
 static const TickType_t update_period = pdMS_TO_TICKS(10);
 
@@ -267,10 +267,12 @@ static void motor_control_task(void* params) {
     // }
 
     if (low_point_defined && high_point_defined) {
-      amplitude = fmin(BOUNCE_AMPLITUDE, 0.5 * (high_point - low_point));
+      float ref_point = 0.5 * (high_point + low_point);
+      // amplitude = fmin(BOUNCE_AMPLITUDE, 0.5 * (high_point - low_point));
+      amplitude = fmin(ref_point, 0.5 * (high_point - low_point));
 
-      if (actuator->position > REFERENCE_HEIGHT - 0.5 * amplitude &&
-          actuator->position < REFERENCE_HEIGHT + 0.5 * amplitude) {
+      if (actuator->position > REFERENCE_HEIGHT - 0.6 * amplitude &&
+          actuator->position < REFERENCE_HEIGHT + 0.6 * amplitude) {
         go(actuator->speed >= 0 ? +1.0 : -1.0);
       } else {
         go(0.);
