@@ -36,11 +36,11 @@ static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
 static const float ACTUATOR_HEIGHT = 7500.;
 static const float REFERENCE_HEIGHT = 0.4 * ACTUATOR_HEIGHT;
 static const float BOUNCE_AMPLITUDE = 1500.0;
-static const float AMPLITUDE_RAMP_RATE = 0.5;  // pos. units / timestep
+// static const float AMPLITUDE_RAMP_RATE = 0.5;  // pos. units / timestep
 static const TickType_t update_period = pdMS_TO_TICKS(10);
 
-static const float BOUNCE_PERIOD = 1.5;  // seconds
-static const float BOUNCE_FREQUENCY = 2 * M_PI / BOUNCE_PERIOD;
+// static const float BOUNCE_PERIOD = 1.5;  // seconds
+// static const float BOUNCE_FREQUENCY = 2 * M_PI / BOUNCE_PERIOD;
 
 // For inter-task communication
 static xQueueHandle limit_switch_queue;
@@ -82,8 +82,9 @@ void filter_ema(const float alpha, const float x_meas, float* x_filt) {
   *x_filt = (1.0 - alpha) * x_meas + alpha * (*x_filt);
 }
 
-static float bounce_setpoint(const float t_ms, const float amplitude) {
-  return REFERENCE_HEIGHT + amplitude * sin(BOUNCE_FREQUENCY * t_ms / 1000.);
+static float bounce_setpoint(const float t, const float reference_height,
+                             const float amplitude, const float period) {
+  return reference_height + amplitude * sin(2 * M_PI * t / period);
 }
 
 static void update_actuator_data(int encoder_position,
@@ -128,7 +129,7 @@ esp_err_t home_actuator(rotary_encoder_info_t* encoder_info,
     update_actuator_data(encoder_state->position, encoder_state->direction,
                          actuator);
     gpio_set_level(MOTOR_DIR_PIN, DIRECTION_DOWN);
-    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 30.0);
+    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 50.0);
     vTaskDelay(update_period);
   }
 
@@ -140,7 +141,7 @@ esp_err_t home_actuator(rotary_encoder_info_t* encoder_info,
 
     update_actuator_data(encoder_state->position, encoder_state->direction,
                          actuator);
-    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 30.0);
+    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 100.0);
     vTaskDelay(update_period);
   }
   ESP_LOGD("HOMING", "Homing complete! At reference point.");
@@ -235,22 +236,46 @@ static void motor_control_task(void* params) {
   int64_t start_time = esp_timer_get_time();  // microseconds
 
   float amplitude = 0;
+  float prev_speed = 0.;
+  float peak_time = 0, prev_peak_time = 0;
+  float low_point = 0., high_point = 0.;
+  bool low_point_defined = false, high_point_defined = false;
 
   while (true) {
     xSemaphoreTake(master_tick_signal, 2 * update_period);
 
     // Sensor update
+    prev_speed = actuator->speed;
     ESP_ERROR_CHECK(rotary_encoder_get_state(&encoder_info, &encoder_state));
     update_actuator_data(encoder_state.position, encoder_state.direction,
                          actuator);
 
-    const float t_ms = (esp_timer_get_time() - start_time) / 1000.;
+    // Find extrema by polling for velocity sign changes above the limit switch
+    if (prev_speed < 0 && actuator->speed >= 0 && actuator->position > 0.) {
+      low_point = actuator->position;
+      low_point_defined = true;
+    }
+    if (prev_speed > 0 && actuator->speed <= 0 && actuator->position > 0.) {
+      high_point = actuator->position;
+      high_point_defined = true;
+      prev_peak_time = peak_time;
+      peak_time = esp_timer_get_time();
+    }
+
+    if (low_point_defined && high_point_defined) {
+      const float t = esp_timer_get_time() - start_time;  // microseconds
+      amplitude = fmin(BOUNCE_AMPLITUDE, 0.5 * (high_point - low_point));
+      const float reference_height = 0.5 * (low_point + high_point);
+      const float period =
+          clip(peak_time - prev_peak_time, 0.5 * 1e6, 10 * 1e6);
+      pid.setpoint = bounce_setpoint(t, reference_height, amplitude, period);
+    }
 
     // Ramp towards BOUNCE_AMPLITUDE at the assigned ramp rate
-    if (amplitude < BOUNCE_AMPLITUDE) {
-      amplitude += AMPLITUDE_RAMP_RATE;
-    }
-    pid.setpoint = bounce_setpoint(t_ms, amplitude);
+    // if (amplitude < BOUNCE_AMPLITUDE) {
+    //   amplitude += AMPLITUDE_RAMP_RATE;
+    // }
+    // pid.setpoint = bounce_setpoint(t_ms, amplitude);
 
     // Compute PID output
     const float dxdt = actuator->speed / pdTICKS_TO_MS(update_period);
