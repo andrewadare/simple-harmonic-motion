@@ -16,7 +16,7 @@
 // local
 #include "actuator.h"
 #include "chip_introspection.h"
-// #include "pid_control.h"
+#include "pid_control.h"
 #include "rotary_encoder.h"
 
 // Pin assignments on ESP32 dev board (NodeMCU-32S)
@@ -46,6 +46,13 @@ static const TickType_t update_period = pdMS_TO_TICKS(10);
 static xQueueHandle limit_switch_queue;
 xSemaphoreHandle master_tick_signal;
 xSemaphoreHandle uart_mutex;
+
+// Returns y(x) evaluated from a point-slope linear function defined by the two
+// intervals [x1, x2] and [y1, y2]. x need not lie in [x1, x2].
+float map_linear(const float x, const float x1, const float x2, const float y1,
+                 const float y2) {
+  return y1 + (y2 - y1) / (x2 - x1) * (x - x1);
+}
 
 static void IRAM_ATTR limit_switch_isr(void* args) {
   int pin_number = (int)args;
@@ -140,12 +147,16 @@ esp_err_t home_actuator(rotary_encoder_info_t* encoder_info,
 
     update_actuator_data(encoder_state->position, encoder_state->direction,
                          actuator);
-    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 30.0);
+    mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 90.0);
     vTaskDelay(update_period);
   }
   ESP_LOGD("HOMING", "Homing complete! At reference point.");
 
   mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 0.0);
+
+  // Hopefully the return to center was energetic enough to overshoot slightly,
+  // initiating oscillation. Pause a moment to let this happen.
+  vTaskDelay(pdMS_TO_TICKS(500));
 
   return ESP_OK;
 }
@@ -271,9 +282,15 @@ static void motor_control_task(void* params) {
       // amplitude = fmin(BOUNCE_AMPLITUDE, 0.5 * (high_point - low_point));
       amplitude = fmin(ref_point, 0.5 * (high_point - low_point));
 
-      if (actuator->position > REFERENCE_HEIGHT - 0.6 * amplitude &&
-          actuator->position < REFERENCE_HEIGHT + 0.6 * amplitude) {
-        go(actuator->speed >= 0 ? +1.0 : -1.0);
+      const float duty =
+          clip(map_linear(fabs(REFERENCE_HEIGHT - actuator->position),
+                          ACTUATOR_HEIGHT / 2, 0., 0., 1.),
+               0., 1.);
+
+      if (actuator->position > REFERENCE_HEIGHT - 1.0 * amplitude &&
+          actuator->position < REFERENCE_HEIGHT + 1.0 * amplitude) {
+        // go(actuator->speed >= 0 ? +1.0 : -1.0);
+        go(actuator->speed >= 0 ? +duty : -duty);
       } else {
         go(0.);
       }
