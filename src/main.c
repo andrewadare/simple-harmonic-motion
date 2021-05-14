@@ -36,7 +36,7 @@ static const float POSITION_UNITS_PER_ENCODER_UNIT = 1.0;
 static const float ACTUATOR_HEIGHT = 7500.;
 static const float REFERENCE_HEIGHT = 0.4 * ACTUATOR_HEIGHT;
 static const float BOUNCE_AMPLITUDE = 1500.0;
-// static const float AMPLITUDE_RAMP_RATE = 0.5;  // pos. units / timestep
+static const float AMPLITUDE_RAMP_RATE = 0.5;  // pos. units / timestep
 static const TickType_t update_period = pdMS_TO_TICKS(10);
 
 // static const float BOUNCE_PERIOD = 1.5;  // seconds
@@ -147,6 +147,7 @@ esp_err_t home_actuator(rotary_encoder_info_t* encoder_info,
   ESP_LOGD("HOMING", "Homing complete! At reference point.");
 
   mcpwm_set_duty(MOTOR_PWM_UNIT, MOTOR_PWM_TIMER, MCPWM_OPR_A, 0.0);
+  vTaskDelay(pdMS_TO_TICKS(1000));
 
   return ESP_OK;
 }
@@ -262,19 +263,22 @@ static void motor_control_task(void* params) {
       peak_time = esp_timer_get_time();
     }
 
+    // Ramp towards BOUNCE_AMPLITUDE at the assigned ramp rate
+    if (amplitude < BOUNCE_AMPLITUDE) {
+      amplitude += AMPLITUDE_RAMP_RATE;
+    }
+
     if (low_point_defined && high_point_defined) {
       const float t = esp_timer_get_time() - start_time;  // microseconds
-      amplitude = fmin(BOUNCE_AMPLITUDE, 0.5 * (high_point - low_point));
-      const float reference_height = 0.5 * (low_point + high_point);
-      const float period =
-          clip(peak_time - prev_peak_time, 0.5 * 1e6, 10 * 1e6);
+      // amplitude = fmin(BOUNCE_AMPLITUDE, 0.5 * (high_point - low_point));
+
+      // const float reference_height = 0.5 * (low_point + high_point);
+      const float reference_height = 0.4 * ACTUATOR_HEIGHT;
+      const float period = 1.5 * 1e6;
+      // clip(peak_time - prev_peak_time, 0.5 * 1e6, 10 * 1e6);
       pid.setpoint = bounce_setpoint(t, reference_height, amplitude, period);
     }
 
-    // Ramp towards BOUNCE_AMPLITUDE at the assigned ramp rate
-    // if (amplitude < BOUNCE_AMPLITUDE) {
-    //   amplitude += AMPLITUDE_RAMP_RATE;
-    // }
     // pid.setpoint = bounce_setpoint(t_ms, amplitude);
 
     // Compute PID output
